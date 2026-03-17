@@ -1,0 +1,222 @@
+---
+title: "MTH6139 Time Series"
+author: "Nur Adlina Nabihah Adnan"
+date: "Spring Term 2026"
+output: 
+  html_document: 
+   toc: true
+   toc_float: true
+   theme: spacelab
+   highlight: tango
+---
+
+```{r, echo=FALSE}
+# This code will display the QMUL logo at the top right of the page
+# Do not change this code
+htmltools::img(src = knitr::image_uri("images/QMlogo.png"),
+               alt = 'logo',
+               style = 'position:absolute; top:0; right:0; padding:10px; width:20%;')
+```
+
+
+# Introduction
+
+## What Are We Trying to Do?
+
+This project investigates how much interest people in the **United Kingdom** have shown in **Malaysia** over the past two decades, as measured by Google search activity. We then use **Meta's Prophet** forecasting system to predict how that interest might evolve over the next three years.
+
+Why does this matter? 
+Search interest is a useful proxy for **tourism intent**. When someone in the UK types "Malaysia" into Google, they might be researching a holiday, reading about a news event, or planning to visit friends and family. By modelling the trend and seasonal patterns in this data, we can gain insight into when Malaysia attracts the most attention for UK residents and whether that interest is growing or declining over time.
+
+The data comes from **Google Trends**, which measures search interest on a relative scale from 0 to 100. A value of 100 represents the month with the highest search volume in the dataset; all other months are expressed as a proportion of that peak. This means we are not working with raw search counts but we are working with a **relative popularity index**.
+
+## Installation
+
+Prophet can be installed from CRAN or from Meta's GitHub. These commands are shown for reference and should be run once in the R console, not inside this document:
+
+```r
+# Standard CRAN install
+install.packages("prophet")
+
+# Latest release from GitHub (recommended by Meta)
+install.packages("remotes")
+remotes::install_github("facebook/prophet@*release", subdir = "R")
+```
+
+For this project the CRAN version was used.
+
+
+Here we are loading all libraries required for this file:
+```{r libraries, message=FALSE}
+library(prophet)  # Meta's Prophet forecasting system
+library(ggplot2)  #Visualisation
+library(lubridate) # Working with dates
+```
+
+---
+
+# The Data
+
+## Source: Google Trends
+
+The data was downloaded from [trends.google.com](https://trends.google.com) with the following settings:
+
+- **Search term:** Malaysia
+- **Geography:** United Kingdom
+- **Time range:** January 2004 to present
+- **Search type:** Web Search
+
+When a date range spanning more than five years is selected, Google Trends automatically aggregates the data to **monthly** resolution. The result is a single column of values from 0 to 100, where **100 = the month with the highest search interest** in the entire period. Every other month is scaled relative to that peak.
+
+## Loading and Cleaning
+
+The CSV file has two columns which are `Time` and `Malaysia`. We load it, rename the columns to the names Prophet requires (`ds` for dates, `y` for values), and convert the date column to a proper R `Date` object.
+
+```{r load-data}
+Malaysia <- read.csv("data/MalaysiaGoogleSearchinUK.csv")
+```
+
+```{r clean-data}
+# Rename to Prophet-required names
+colnames(Malaysia) <- c("ds", "y")
+
+# Parse dates explicitly
+Malaysia$ds <- as.Date(Malaysia$ds, format = "%Y-%m-%d")
+
+# Ensure y is numeric
+Malaysia$y <- as.numeric(Malaysia$y)
+
+# Drop any incomplete rows
+MalaysiaData <- Malaysia[complete.cases(Malaysia), ]
+
+```
+
+We have `r nrow(MalaysiaData)` monthly observations spanning over two decades. 
+The average search index across the entire period is `r round(mean(MalaysiaData$y), 1)` out of 100. 
+The peak month was `r format(MalaysiaData$ds[which.max(MalaysiaData$y)], "%B %Y")` — almost certainly reflecting the intense global media coverage of the **MH370 disappearance**.
+The lowest recorded month was `r format(MalaysiaData$ds[which.min(MalaysiaData$y)], "%B %Y")`, during the depths of the **COVID-19 pandemic** when international travel had effectively stopped.
+
+---
+
+# Exploratory Analysis
+
+Before fitting any model, we should spend time understanding the data visually and numerically. A good forecast starts with a good understanding of the series.
+
+## The Full Picture (2004–2026)
+
+```{r plot-full}
+ggplot(MalaysiaData, aes(x = ds, y = y)) +
+ geom_line(colour = "blue", linewidth = 0.6) +
+ geom_point(size = 0.8, colour = "blue", alpha = 0.4) +
+ # Annotate the two most notable events 
+ annotate("rect",xmin = as.Date("2014-03-01"), xmax = as.Date("2014-12-01"),
+          ymin = -Inf, ymax = Inf,
+          fill = "red", alpha = 0.1) +
+ annotate("text", x = as.Date("2014-07-01"), y = 95,
+          label = "MH370\nMar 2014", colour = "red", size = 3.5, fontface = "bold") + 
+ annotate("rect",
+          xmin = as.Date("2020-03-01"), xmax = as.Date("2021-07-01"),
+          ymin = -Inf, ymax = Inf,
+          fill = "orange", alpha = 0.1) + 
+ annotate("text", x = as.Date("2020-11-01"), y = 95,
+          label = "COVID-19\n2020–21", colour = "orange", size = 3.5, fontface = "bold") +
+ labs(
+     title = "UK Google Search Interest for \"Malaysia\", 2004–2026",
+     subtitle = "Monthly relative index (0 = lowest, 100 = peak month) | Source: Google Trends",
+     x = NULL,
+     y = "Search Interest Index"
+     ) +
+theme_minimal(base_size = 13)
+```
+
+Two events stand out immediately:
+
+1. **March 2014 — MH370:**
+Malaysia Airlines flight MH370 disappeared on 8 March 2014. The search index jumped dramatically as the story dominated global news for months. This is an **externally-driven spike** with no tourism meaning which reflects news interest, not travel intent.
+
+2. **2020–2021 — COVID-19:** 
+International travel restrictions caused UK search interest in Malaysia to fall to its lowest recorded levels. This is an **externally-driven trough** that temporarily suppressed what would otherwise have been normal seasonal search patterns.
+
+Both of these are anomalies that could distort a forecasting model if left untreated.
+
+---
+
+# Prophet Forecasting
+
+## Preparing the Model
+
+Now that we understand the data, we are ready to fit a Prophet model. We use the cleaned `MalaysiaData` dataframe with the `ds` and `y` columns.
+
+```{r fit-model, message=FALSE}
+ProphetModel <- prophet(MalaysiaData)
+```
+
+## Forecasting Three Years Ahead
+
+We ask Prophet to generate forecasts for the next 36 months beyond the end of our data. The `make_future_dataframe()` function creates a dataframe of future dates, and `predict()` fills in the forecasted values along with uncertainty bounds.
+
+```{r forecast}
+FutureDates <- make_future_dataframe(ProphetModel, periods = 36, freq = "month")
+ProphetForecast <- predict(ProphetModel, FutureDates)
+
+# Preview the future forecast rows
+head(ProphetForecast[,c("ds", "yhat", "yhat_lower", "yhat_upper")], 5)
+tail(ProphetForecast[,c("ds", "yhat", "yhat_lower", "yhat_upper")], 5)
+```
+
+The forecast includes three columns: `yhat`, `yhat_lower` and `yhat_upper`. 
+The uncertainty band widens the further we forecast into the future, which correctly reflects the greater difficulty of predicting more distant time points.
+
+## The Forecast Plot
+
+```{r plot-forecast}
+plot(ProphetModel, ProphetForecast) +
+ labs(
+ title = "Prophet Forecast – UK Search Interest for Malaysia",
+ subtitle = "Black dots = observed data | Blue line = model fit and forecast | Shaded band = 80% uncertainty interval",
+ x = NULL,
+ y = "Search Interest Index (0–100)"
+ ) +
+ theme_minimal(base_size = 13)
+```
+
+The forecast plot shows the full history of observed data (black dots) alongside the model's fitted values (blue line) and its two-year-ahead forecast. Several things are worth noting:
+
+- The model fits the historical data reasonably well, capturing both the general trend and the recurring seasonal peaks.
+- The MH370 spike in 2014 is partially absorbed into the trend, which may cause a slight overestimate in the near-term forecast if that spike inflated the perceived level of the series.
+- The COVID-19 trough is also visible — Prophet treats this as a genuine change point rather than a temporary anomaly, which means the post-COVID recovery is being modelled as a new trend phase.
+- The forecast for 2026–2028 shows **modest continued interest**, with the seasonal pattern persisting.
+
+## Decomposing the Forecast: Trend and Seasonality
+
+We can decompose the forecast into its constituent components. This lets us separately examine the **long-run trend** and the **seasonal pattern**, rather than having them mixed together in a single line.
+
+```{r plot-components, warning=FALSE}
+prophet_plot_components(ProphetModel, ProphetForecast)
+```
+
+**Trend:** The trend component shows the smoothed long-run direction of UK search interest in Malaysia. We can see whether interest has been growing or declining over the full period, and where the major structural breaks occurred. In this case they are MH370 in 2014, COVID in 2020, recovery from 2022 onwards.
+
+**Yearly seasonality :** This graph shows the average within-year pattern, expressed as the contribution to the index from seasonality alone. Positive values mean that month tends to be above the trend; negative values mean below it. A peak in July or August would confirm that UK summer holidays are the primary driver of seasonal search interest in Malaysia.
+
+---
+
+# Discussion and Conclusions
+
+## Key Findings
+
+1. **UK search interest in Malaysia is genuinely seasonal.**
+The data shows a consistent within-year pattern, most likely driven by UK travel planning cycles around school holidays. The summer months (July–August) tend to show the highest search interest.
+
+2. **Two major external events dominate the history of this series.** 
+The MH370 disappearance in March 2014 caused a spike driven by news interest rather than tourism. The COVID-19 pandemic caused a more prolonged collapse in 2020–2021. 
+
+3. **The Prophet forecast is cautiously optimistic.** 
+The model predicts that search interest will continue at broadly similar levels to the post-COVID recovery period, with the seasonal pattern intact.
+
+
+
+
+
+
+
